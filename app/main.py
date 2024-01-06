@@ -37,7 +37,8 @@ nuanced details, or comparing statements from multiple sources. The multi-docume
 expert's approach to research and analysis, using a rich set of data and tools for a more robust and informed response.
 """
 # System imports
-import asyncio
+from contextlib import asynccontextmanager
+import json
 from pathlib import Path
 import os
 import pickle
@@ -69,6 +70,8 @@ from llama_index.llms import OpenAI
 from llama_index.agent import FnRetrieverOpenAIAgent, ReActAgent
 from tqdm import tqdm
 from llama_index.schema import BaseNode
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 #
 
@@ -275,9 +278,10 @@ async def create_document_agents(
     return document_agents, extra_info
 
 
-async def main() -> None:
-    url = "https://docs.llamaindex.ai/en/latest/"
-    corpus_name = "llamaindex_docs"
+async def create_multidoc_agent(
+    url: str,
+    corpus_name: str,
+) -> None:
     data_base_path = os.getenv("DATA_BASE_PATH", "./data")
 
     llm = OpenAI(
@@ -297,7 +301,7 @@ async def main() -> None:
     docs = load_documents_from_directory(
         directory_path=corpus_path,
         suffix_filter=".html",
-        limit=10,
+        # limit=10,
     )
 
     document_agents, extra_info = await create_document_agents(
@@ -318,14 +322,6 @@ async def main() -> None:
             ),
         )
         all_tools.append(doc_tool)
-
-    # tool_names = [key for key in document_agents.keys()]
-    # tools_metadata = [extra_info[key]["summary"] for key in document_agents.keys()]
-
-    # for tool_name, metadata in zip(tool_names, tools_metadata):
-    #     print(f"Tool Name: {tool_name}")
-    #     print(f"Metadata Summary: {metadata}")
-    #     print("-" * 40)
 
     tool_mapping = SimpleToolNodeMapping.from_objects(all_tools)
     obj_index = ObjectIndex.from_objects(
@@ -355,10 +351,92 @@ async def main() -> None:
         llm=llm,
         verbose=True,
     )
-
-    r = top_agent.query("What are the parameters for the simple file node parser?")
-    print(r)
+    return top_agent
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+#
+
+
+# Store agents in a dictionary
+agents = {}
+
+
+# Load agents from the JSON file when the server starts
+async def load_agents():
+    try:
+        data_base_path = os.getenv("DATA_BASE_PATH", "./data")
+        agent_registry_file = os.path.join(data_base_path, "agents.json")
+        with open(agent_registry_file, "r") as f:
+            agents_registry = json.load(f)
+            for corpus_name, url in agents_registry.items():
+                agents[corpus_name] = await create_multidoc_agent(url, corpus_name)
+    except FileNotFoundError:
+        pass  # It's okay if the file doesn't exist
+
+
+def save_agent(
+    corpus_name: str,
+    url: str,
+):
+    data_base_path = os.getenv("DATA_BASE_PATH", "./data")
+    agent_registry = os.path.join(data_base_path, "agents.json")
+    try:
+        with open(agent_registry, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    data.update({corpus_name: url})
+    with open(agent_registry, "w") as f:
+        json.dump(data, f)
+
+
+#
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await load_agents()  # Call the function when the server starts
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Replace "*" with the appropriate origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+#
+
+
+@app.post("/agent/")
+async def create_agent(
+    url: str,
+    corpus_name: str,
+) -> Response:
+    agent = await create_multidoc_agent(url, corpus_name)
+    agents[corpus_name] = agent
+    save_agent(corpus_name=corpus_name, url=url)
+    response = Response(status_code=201)
+    response.headers["Location"] = f"/agent/{corpus_name}"
+    return response
+
+
+@app.post("/agent/{corpus_name}/query")
+async def query_agent(
+    corpus_name: str,
+    query: str,
+) -> str:
+    agent = agents.get(corpus_name)
+    if agent is None:
+        return Response(status_code=404)
+    response = await agent.aquery(query)
+    return response.response
+
+
+#
+
+# url = "https://docs.llamaindex.ai/en/latest/"
+# corpus_name = "llamaindex_docs"

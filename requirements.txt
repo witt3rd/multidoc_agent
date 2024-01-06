@@ -1,3 +1,5 @@
 cohere
+fastapi
 llama-index
 python-dotenv
+uvicorn
