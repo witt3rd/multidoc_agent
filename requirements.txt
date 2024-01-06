@@ -1,0 +1,3 @@
+cohere
+llama-index
+python-dotenv
