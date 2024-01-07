@@ -38,6 +38,7 @@ expert's approach to research and analysis, using a rich set of data and tools f
 """
 # System imports
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import os
@@ -170,59 +171,84 @@ def load_documents_from_directory(
     return docs
 
 
-async def create_document_agent(
-    nodes: Sequence[BaseNode],
-    file_base: str,
+def get_agents_base_path(
     data_base_path: str,
     corpus_name: str,
+) -> str:
+    return os.path.join(data_base_path, corpus_name, "agents")
+
+
+def get_agent_path(
+    data_base_path: str,
+    corpus_name: str,
+    file_base: str,
+) -> str:
+    return os.path.join(get_agents_base_path(data_base_path, corpus_name), file_base)
+
+
+@dataclass
+class AgentPaths:
+    data_base_path: str
+    corpus_name: str
+    file_base: str
+    agent_path: str
+    vector_idx_path: str
+    summary_idx_path: str
+    summary_file_path: str
+
+
+def get_agent_paths(
+    data_base_path: str,
+    corpus_name: str,
+    file_base: str,
+) -> AgentPaths:
+    agent_path = get_agent_path(data_base_path, corpus_name, file_base)
+    vector_idx_path = os.path.join(agent_path, "vector_idx")
+    summary_idx_path = os.path.join(agent_path, "summary_idx")
+    summary_file_path = os.path.join(agent_path, "summary.pkl")
+    paths = AgentPaths(
+        data_base_path=data_base_path,
+        corpus_name=corpus_name,
+        file_base=file_base,
+        agent_path=agent_path,
+        vector_idx_path=vector_idx_path,
+        summary_idx_path=summary_idx_path,
+        summary_file_path=summary_file_path,
+    )
+    return paths
+
+
+async def load_document_agent(
+    agent_paths: AgentPaths,
     service_context: ServiceContext,
 ) -> tuple[OpenAIAgent, str]:
-    base_path = os.path.join(data_base_path, corpus_name, "agents")
-    vi_out_path = os.path.join(base_path, file_base)
-    summary_out_path = os.path.join(base_path, f"{file_base}_summary.pkl")
+    vector_index = load_index_from_storage(
+        StorageContext.from_defaults(persist_dir=agent_paths.vector_idx_path),
+        service_context=service_context,
+    )
 
-    # Create or load the vector index
-    if not os.path.exists(vi_out_path):
-        Path(base_path).mkdir(parents=True, exist_ok=True)
-        vector_index = VectorStoreIndex(nodes, service_context=service_context)
-        vector_index.storage_context.persist(persist_dir=vi_out_path)
-    else:
-        vector_index = load_index_from_storage(
-            StorageContext.from_defaults(persist_dir=vi_out_path),
-            service_context=service_context,
-        )
-
-    # Create or load the summary index
-    summary_index = SummaryIndex(nodes, service_context=service_context)
+    summary_index = load_index_from_storage(
+        StorageContext.from_defaults(persist_dir=agent_paths.summary_idx_path),
+        service_context=service_context,
+    )
+    summary = pickle.load(open(agent_paths.summary_file_path, "rb"))
 
     # Create query engines for the vector and summary indices
     vector_query_engine = vector_index.as_query_engine()
     summary_query_engine = summary_index.as_query_engine(response_mode="tree_summarize")
 
-    # Create or load the summary
-    if not os.path.exists(summary_out_path):
-        Path(summary_out_path).parent.mkdir(parents=True, exist_ok=True)
-        summary = str(
-            await summary_query_engine.aquery(
-                "Extract a concise 1-2 line summary of this document"
-            )
-        )
-        pickle.dump(summary, open(summary_out_path, "wb"))
-    else:
-        summary = pickle.load(open(summary_out_path, "rb"))
-
     query_engine_tools = [
         QueryEngineTool(
             query_engine=vector_query_engine,
             metadata=ToolMetadata(
-                name=f"vector_tool_{file_base}",
+                name=f"vector_tool_{agent_paths.file_base}",
                 description="Useful for questions related to specific facts",
             ),
         ),
         QueryEngineTool(
             query_engine=summary_query_engine,
             metadata=ToolMetadata(
-                name=f"summary_tool_{file_base}",
+                name=f"summary_tool_{agent_paths.file_base}",
                 description="Useful for summarization questions",
             ),
         ),
@@ -245,6 +271,36 @@ You must ALWAYS use at least one of the tools provided when answering a question
     return agent, summary
 
 
+async def create_document_agent(
+    nodes: Sequence[BaseNode],
+    agent_paths: AgentPaths,
+    service_context: ServiceContext,
+) -> tuple[OpenAIAgent, str]:
+    # Create the vector index
+    Path(agent_paths.vector_idx_path).mkdir(parents=True, exist_ok=True)
+    vector_index = VectorStoreIndex(nodes, service_context=service_context)
+    vector_index.storage_context.persist(persist_dir=agent_paths.vector_idx_path)
+
+    # Create the summary index
+    Path(agent_paths.summary_idx_path).mkdir(parents=True, exist_ok=True)
+    summary_index = SummaryIndex(nodes, service_context=service_context)
+    summary_index.storage_context.persist(persist_dir=agent_paths.summary_idx_path)
+
+    # Create the summary
+    summary_query_engine = summary_index.as_query_engine(response_mode="tree_summarize")
+    summary = str(
+        await summary_query_engine.aquery(
+            "Extract a concise 1-2 line summary of this document"
+        )
+    )
+    pickle.dump(summary, open(agent_paths.summary_file_path, "wb"))
+
+    return await load_document_agent(
+        agent_paths=agent_paths,
+        service_context=service_context,
+    )
+
+
 async def create_document_agents(
     docs: list[Document],
     data_base_path: str,
@@ -256,21 +312,30 @@ async def create_document_agents(
     document_agents = {}
     extra_info = {}
 
-    for doc in docs:
-        nodes = node_parser.get_nodes_from_documents([doc])
-
+    for doc in tqdm(docs, desc="Creating document agents"):
         # ID will be base + parent
         file_path = Path(doc.metadata["path"])
         file_base = str(file_path.parent.stem) + "_" + str(file_path.stem)
         file_base = file_base.replace(".", "_")
 
-        agent, summary = await create_document_agent(
-            nodes=nodes,
-            file_base=file_base,
+        agent_paths = get_agent_paths(
             data_base_path=data_base_path,
             corpus_name=corpus_name,
-            service_context=service_context,
+            file_base=file_base,
         )
+
+        if os.path.exists(agent_paths.agent_path):
+            agent, summary = await load_document_agent(
+                agent_paths=agent_paths,
+                service_context=service_context,
+            )
+        else:
+            nodes = node_parser.get_nodes_from_documents([doc])
+            agent, summary = await create_document_agent(
+                nodes=nodes,
+                agent_paths=agent_paths,
+                service_context=service_context,
+            )
 
         document_agents[file_base] = agent
         extra_info[file_base] = {"summary": summary, "nodes": nodes}
